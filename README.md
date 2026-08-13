@@ -35,7 +35,7 @@ action1-mcp                                  # stdio transport
 Wire it into Claude Code:
 
 ```bash
-claude mcp add action1 --transport stdio --command action1-mcp
+claude mcp add action1 -- action1-mcp
 ```
 
 ### Shared HTTP server
@@ -73,8 +73,11 @@ that check is a backstop, not a deployment plan — see
 | `ACTION1_REGION` | `NorthAmerica` | `NorthAmerica`, `NA-2`, `Europe`, `Australia` |
 | `ACTION1_DEFAULT_ORG_ID` | unset | Org used when a tool is called without `org_id` |
 | `ACTION1_MCP_BEARER` | unset | Bearer token required by the HTTP transport |
+| `ACTION1_MCP_TRANSPORT` | `stdio` | `stdio` or `http`; `--transport` overrides it |
+| `ACTION1_MCP_HOST` | `127.0.0.1` | HTTP bind address; `--host` overrides it |
+| `ACTION1_MCP_PORT` | `3002` | HTTP bind port; `--port` overrides it |
 | `ACTION1_RATE_LIMIT_PER_MINUTE` | `25` | Local throttle; Action1's ceiling is 30/min **per tenant** |
-| `ACTION1_MAX_ITEMS` | `1000` | Cap on items one tool call will page through |
+| `ACTION1_MAX_ITEMS` | `1000` | Hard ceiling on items one tool call will page through. A tool's `limit` can ask for fewer, never more |
 | `ACTION1_PAGE_SIZE` | `200` | Items per API request |
 | `ACTION1_TIMEOUT_SECONDS` | `60` | Per-request timeout |
 | `ACTION1_MAX_429_RETRIES` | `3` | Retries after a rate-limit response |
@@ -100,9 +103,11 @@ Every list tool returns the same envelope:
 {"items": [...], "returned": 200, "total_items": 1432, "truncated": true}
 ```
 
-`truncated: true` means the cap stopped the walk before the data ran out. The
-list is a prefix, not the whole set — narrow the query rather than concluding
-from a partial answer.
+`truncated: true` means more data may exist beyond what came back. The list is a
+prefix, not the whole set — narrow the query rather than concluding from a
+partial answer. The flag errs towards `true`: several Action1 endpoints return no
+`total_items` at all, and a missing counter is not evidence that the page you got
+was everything.
 
 ## Rate limiting
 

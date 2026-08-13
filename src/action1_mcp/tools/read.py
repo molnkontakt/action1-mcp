@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from action1_mcp.app import mcp
-from action1_mcp.client import get_client, resolve_org_id
+from action1_mcp.client import Action1Error, get_client, resolve_org_id
 
 # `fields=*` asks Action1 for extended data (e.g. missing_critical_updates on
 # endpoints). Only some endpoints support it, and the docs warn those queries are
@@ -35,6 +35,44 @@ def _paged(
     params: dict[str, Any] = dict(extra or {})
     params.update(filters or {})
     return get_client().get_paged(path, params=params, max_items=limit)
+
+
+def _flatten_report_rows(result: dict[str, Any]) -> dict[str, Any]:
+    """Lift `ReportRow.fields` to the top level of each item.
+
+    Report-backed endpoints (`/apps/{org}/data`, `/reportdata/.../data`) return rows
+    shaped like::
+
+        {"id": "%255B%2522...", "type": "ReportRow",
+         "self": "https://app.eu.action1.com/api/3.0/reportdata/.../data/%255B...",
+         "fields": {"Name": "7-Zip (x64 edition)", "Version": "22.01.00.0", ...}}
+
+    The payload is entirely in `fields`; `self` is a ~250-character URL repeating the
+    already-present id, and `type` is the same string on every row. Flattening makes
+    the data legible and cuts the response size several-fold on a real tenant.
+
+    `id` is kept verbatim — it is a double-URL-encoded composite key and is the only
+    way to address a single row, so decoding it would break round-tripping.
+    Rows that are not `ReportRow` are passed through untouched.
+    """
+    items = result.get("items")
+    if not isinstance(items, list):
+        return result
+
+    flattened: list[Any] = []
+    for row in items:
+        if not isinstance(row, dict) or not isinstance(row.get("fields"), dict):
+            flattened.append(row)
+            continue
+        merged: dict[str, Any] = {"id": row.get("id")} if row.get("id") is not None else {}
+        # Field names win over the row's own metadata only where they do not collide;
+        # a report column literally called "id" would otherwise silently replace the key
+        # needed to address the row.
+        for key, value in row["fields"].items():
+            merged["field_id" if key == "id" else key] = value
+        flattened.append(merged)
+
+    return {**result, "items": flattened}
 
 
 # --- identity & tenant ----------------------------------------------------
@@ -213,11 +251,16 @@ def action1_list_installed_apps(
         endpoint_id: restrict to one endpoint's installed software.
         limit: max entries to return.
         filters: extra Action1 query parameters passed through verbatim.
+
+    Returns:
+        Standard list envelope. This endpoint is report-backed, so each item is
+        flattened from a `ReportRow` — expect columns like `Name`, `Version`,
+        `Vendor` and `Install Type` at the top level, plus the row `id`.
     """
     path = f"/apps/{resolve_org_id(org_id)}/data"
     if endpoint_id:
         path = f"{path}/{endpoint_id}"
-    return _paged(path, limit, None, filters)
+    return _flatten_report_rows(_paged(path, limit, None, filters))
 
 
 @mcp.tool()
@@ -350,16 +393,68 @@ def action1_list_scripts(limit: int = 200) -> dict[str, Any]:
 # --- reports --------------------------------------------------------------
 
 
+# `/reports/all` returns only the top-level *categories*, not report definitions —
+# those live one level down under `/reports/{category_id}/children`. Bounded so a wide
+# category tree cannot fan out into the per-tenant rate limit.
+_MAX_REPORT_CATEGORIES = 8
+
+
 @mcp.tool()
 def action1_list_reports(limit: int = 200) -> dict[str, Any]:
-    """List the report definitions available in the tenant.
+    """List report definitions, expanding the report category tree one level.
 
-    Pair with action1_get_report_data to read one.
+    `/reports/all` returns categories rather than reports, so this walks each
+    category's children to reach the actual definitions.
 
     Args:
         limit: max reports to return.
+
+    Returns:
+        Standard list envelope plus `categories`. Each report's `id` is what
+        `action1_get_report_data` needs. If the children could not be read — the
+        endpoint requires a role permission an API-only user may lack — `items` is
+        empty and `note` explains what to do instead.
     """
-    return _paged("/reports/all", limit)
+    client = get_client()
+    top = client.get_paged("/reports/all", max_items=limit)
+    entries = [i for i in top.get("items", []) if isinstance(i, dict)]
+    categories = [i for i in entries if i.get("type") == "ReportCategory"]
+    reports = [i for i in entries if i.get("type") != "ReportCategory"]
+
+    denied: list[str] = []
+    for category in categories[:_MAX_REPORT_CATEGORIES]:
+        category_id = category.get("id")
+        if not category_id or len(reports) >= limit:
+            continue
+        try:
+            children = client.get_paged(
+                f"/reports/{category_id}/children", max_items=limit - len(reports)
+            )
+        except Action1Error as exc:
+            denied.append(f"{category_id}: {exc.status} {exc.developer_message}")
+            continue
+        reports.extend(
+            row
+            for row in children.get("items", [])
+            if isinstance(row, dict) and row.get("type") != "ReportCategory"
+        )
+
+    result: dict[str, Any] = {
+        "items": reports,
+        "returned": len(reports),
+        "total_items": None,
+        "truncated": len(categories) > _MAX_REPORT_CATEGORIES,
+        "categories": [{"id": c.get("id"), "name": c.get("name")} for c in categories],
+    }
+    if denied and not reports:
+        result["note"] = (
+            "No report definitions could be listed — reading the categories' children was "
+            f"refused ({'; '.join(denied)}). Report IDs are stable slugs rather than UUIDs, "
+            "so action1_get_report_data can still be called directly with one: 'all_apps' is "
+            "known to work, and any report row's `self` URL contains the slug that produced it. "
+            "Do not pass a category id such as 'cat_builtin' — that returns 400."
+        )
+    return result
 
 
 @mcp.tool()
@@ -375,11 +470,16 @@ def action1_get_report_data(
     so figures can lag the console.
 
     Args:
-        report_id: report ID from action1_list_reports.
+        report_id: a report **slug**, not a category id — e.g. `all_apps`. Passing a
+            category id like `cat_builtin` returns 400 "Report ... not found".
         org_id: organization ID; defaults to the server's configured organization.
         limit: max rows to return.
         filters: extra Action1 query parameters passed through verbatim.
+
+    Returns:
+        Standard list envelope with each `ReportRow` flattened, so the report's own
+        columns appear at the top level alongside the row `id`.
     """
-    return _paged(
-        f"/reportdata/{resolve_org_id(org_id)}/{report_id}/data", limit, None, filters
+    return _flatten_report_rows(
+        _paged(f"/reportdata/{resolve_org_id(org_id)}/{report_id}/data", limit, None, filters)
     )

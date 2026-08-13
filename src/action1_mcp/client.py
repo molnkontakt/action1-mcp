@@ -18,6 +18,7 @@ worker thread.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
@@ -35,6 +36,12 @@ TOKEN_REFRESH_MARGIN_SECONDS = 120
 # Used only when a 429 arrives without a usable `retry_after`: 2 s, 4 s, 8 s.
 # Mirrors the fallback in Action1's own documented retry examples.
 FALLBACK_RETRY_BASE_SECONDS = 2
+
+# Ceiling on a delay we were *told* to wait. The value is upstream-controlled and we
+# sleep on it inside a tool call, so an absurd one (or a proxy-generated `inf`) would
+# hang a worker with no way to cancel it — `ACTION1_TIMEOUT_SECONDS` bounds the
+# request, not the sleep.
+MAX_RETRY_AFTER_SECONDS = 120
 
 
 class Action1Error(RuntimeError):
@@ -124,14 +131,18 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
                 value = float(details["retry_after"])
             except (KeyError, TypeError, ValueError):
                 value = -1.0
-            if value >= 0:
-                return value
+            if math.isfinite(value) and value >= 0:
+                return min(value, MAX_RETRY_AFTER_SECONDS)
     header = response.headers.get("Retry-After")
     if header:
         try:
-            return float(header)
+            value = float(header)
         except ValueError:
+            # An HTTP-date Retry-After lands here; fall through to backoff.
             return None
+        if not math.isfinite(value) or value < 0:
+            return None
+        return min(value, MAX_RETRY_AFTER_SECONDS)
     return None
 
 
@@ -154,7 +165,12 @@ class Action1Client:
         http: httpx.Client | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self._http = http or httpx.Client(timeout=self.settings.timeout_seconds)
+        # follow_redirects stays off deliberately: we attach the bearer to every
+        # request, and a redirect we follow blindly would carry it to whatever host
+        # the response names. Redirects are surfaced as errors instead — see request().
+        self._http = http or httpx.Client(
+            timeout=self.settings.timeout_seconds, follow_redirects=False
+        )
         self._limiter = _RateLimiter(self.settings.rate_limit_per_minute)
         self._token: str | None = None
         self._token_expires_at = 0.0
@@ -257,7 +273,11 @@ class Action1Client:
                 time.sleep(delay)
                 continue
 
-            if response.status_code >= 400:
+            if response.status_code >= 300:
+                # 3xx included on purpose. We do not follow redirects, so a 302 would
+                # otherwise fall through to the empty-body branch below and return {},
+                # which `get_paged` turns into an empty item list. "No CVEs detected"
+                # is the worst possible way for a security tool to fail.
                 raise _error_from_response(response, path)
 
             if not response.content:
@@ -318,15 +338,25 @@ class Action1Client:
     ) -> dict[str, Any]:
         """Walk a `ResultPage` and collect its items.
 
-        Stops at `max_items` (default `ACTION1_MAX_ITEMS`) and says so in the
+        Stops at `max_items`, bounded by `ACTION1_MAX_ITEMS`, and says so in the
         result rather than silently returning a partial list.
 
         Returns:
             `{items, returned, total_items, truncated}` — `total_items` is the
             server-side total when Action1 reports one, else None. `truncated` is
-            True when the cap stopped the walk before the data ran out.
+            True when more data may exist beyond what was returned. It errs towards
+            True: over-reporting tells the caller to narrow the query, while
+            under-reporting makes a partial answer look complete.
         """
-        cap = max_items if max_items is not None else self.settings.max_items
+        # `ACTION1_MAX_ITEMS` is a ceiling, not merely a default. A caller may ask for
+        # less; asking for more cannot raise it. Without the clamp one tool call with
+        # limit=100000 could sit on the tenant's shared 30 req/min budget for twenty
+        # minutes, since the rate limiter blocks rather than erroring. The max(1, ...)
+        # also floors a negative limit, which would otherwise reach `batch[:-1]`.
+        if max_items is None:
+            cap = self.settings.max_items
+        else:
+            cap = max(1, min(max_items, self.settings.max_items))
         size = page_size or self.settings.page_size
         size = min(size, cap)
 
@@ -340,12 +370,14 @@ class Action1Client:
             page = self.request("GET", url, params=query)
             if not isinstance(page, dict):
                 # A non-envelope response (single object or bare list) is not paged.
-                return {
-                    "items": page if isinstance(page, list) else [page],
-                    "returned": len(page) if isinstance(page, list) else 1,
-                    "total_items": None,
-                    "truncated": False,
-                }
+                if isinstance(page, list):
+                    return {
+                        "items": page[:cap],
+                        "returned": min(len(page), cap),
+                        "total_items": None,
+                        "truncated": len(page) > cap,
+                    }
+                return {"items": [page], "returned": 1, "total_items": None, "truncated": False}
 
             batch = page.get("items")
             if not isinstance(batch, list):
@@ -353,7 +385,7 @@ class Action1Client:
             if total_items is None:
                 total_items = _as_int(page.get("total_items"))
 
-            room = cap - len(items)
+            room = max(cap - len(items), 0)
             if len(batch) > room:
                 items.extend(batch[:room])
                 truncated = True
@@ -361,10 +393,19 @@ class Action1Client:
             items.extend(batch)
 
             if len(items) >= cap:
-                # Exactly full: only truncated if the server has more to give.
-                truncated = bool(total_items is not None and total_items > len(items))
+                # We stopped because the cap filled, not because the data ran out.
+                # Only a server-side total can prove nothing remains — and several
+                # Action1 endpoints (/apps/{org}/data, /policies/instances/{org},
+                # /reports/all) return no `total_items` at all, so absence of a
+                # counter must not be read as "that was everything".
+                truncated = total_items is None or total_items > len(items)
                 break
             if len(batch) < size:
+                # A short page means the data ran out: Action1 honours the requested
+                # limit rather than clamping it (verified against a live tenant —
+                # limit=500 returned 500 rows of 1543). A server-side total still
+                # overrules that inference where one is available.
+                truncated = bool(total_items is not None and total_items > len(items))
                 break
 
             next_url = self._next_url(page)

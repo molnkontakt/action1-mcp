@@ -46,12 +46,33 @@ API root. We attach the bearer token to every hop, so blindly following an
 absolute URL from a response body would turn pagination into an SSRF primitive
 that leaks the token. Off-host `next_page` values fall back to offset arithmetic.
 
-Counters arrive as strings (`"total_items": "1432"`) and are coerced defensively.
+What a live tenant actually returns, which shaped the rest of this:
 
-**Caps are visible.** Every walk stops at `ACTION1_MAX_ITEMS` (default 1000) and
-sets `truncated: true`. A silently truncated list reads to a model as a complete
-one, and "no endpoint is missing that patch" is a materially different claim from
-"none of the first 1000 were".
+- Action1 **honours the requested `limit`** rather than clamping it to the
+  envelope's documented 50 — `limit=500` returned 500 rows of 1543. So a short
+  page really does mean the data ran out.
+- `next_page` is frequently **absent** even mid-collection, so it cannot be used
+  as a "there is more" signal.
+- `total_items` is **absent entirely** on several endpoints (`/apps/{org}/data`,
+  `/policies/instances/{org}`, `/reports/all`, `/endpoints/discovery/{org}`).
+- Counters arrive as strings (`"total_items": "1432"`) and are coerced defensively.
+
+**Caps are visible, and `truncated` errs towards true.** Every walk stops at
+`ACTION1_MAX_ITEMS` (default 1000), which is a ceiling rather than a default: a
+tool's `limit` may ask for fewer, never more. Filling the cap exactly with no
+server-side total reports `truncated: true`, because with no counter and no
+`next_page` there is nothing to prove the data ran out. Over-reporting costs a
+narrowed query; under-reporting makes a partial answer look complete, and "no
+endpoint is missing that patch" is a materially different claim from "none of the
+first 1000 were".
+
+**Report-backed endpoints are flattened.** `/apps/{org}/data` and
+`/reportdata/{org}/{report}/data` return `ReportRow` objects whose payload sits in
+a nested `fields` dict, alongside a ~250-character `self` URL that merely repeats
+the row id. `_flatten_report_rows` lifts the columns to the top level and drops
+`self`/`type`, which makes the data legible and cuts response size several-fold.
+The row `id` is kept verbatim — it is a double-URL-encoded composite key and
+decoding it would break addressing the row.
 
 ## Write tiers (v2, not implemented)
 
